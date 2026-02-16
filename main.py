@@ -3,7 +3,7 @@
 # с системой лимитов и платной подписки
 # ============================================================
 # Установка зависимостей:
-#   pip install aiogram aiohttp
+#   pip install aiogram aiohttp asyncpg
 #
 # Запуск:
 #   python bot.py
@@ -18,7 +18,6 @@
 # ============================================================
 
 import asyncio
-import psycopg2
 import json
 import logging
 import os
@@ -27,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import aiohttp
+import asyncpg
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message,
@@ -48,47 +48,44 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "7947605764:AAGWTfndHVIyN3SV7_zpe3Zr9CoTTI7F8SI"
 
 # Токен платёжной системы (получить у @BotFather → /mybots → Payments)
-# Для тестов используйте тестовый токен провайдера (например Stripe TEST)
-# Примеры провайдеров: Stripe, ЮKassa, Sberbank, LiqPay, и др.
 PAYMENT_TOKEN = " "
+
+# Строка подключения к PostgreSQL (Railway)
+DATABASE_URL = "postgresql://postgres:NskrxqFEpVXbnlVZSSPyQfIEIauSvMAT@crossover.proxy.rlwy.net:55072/railway"
 
 # Количество бесплатных запросов для новых пользователей
 FREE_REQUESTS = 2
 
-# Цены подписок (в копейках/центах — зависит от валюты)
-# 1 звезда Telegram = 1 (для Telegram Stars используйте "XTR" как валюту)
+# Цены подписок
 SUBSCRIPTION_PLANS = {
     "week": {
         "name": "📅 Неделя",
         "duration_days": 7,
-        "price": 15,  
+        "price": 15,
         "label": "Подписка на 7 дней",
     },
     "month": {
         "name": "📆 Месяц",
         "duration_days": 30,
-        "price": 50,  
+        "price": 50,
         "label": "Подписка на 30 дней",
     },
     "year": {
         "name": "📅 Год",
         "duration_days": 365,
-        "price": 500,  
+        "price": 500,
         "label": "Подписка на 365 дней",
     },
     "forever": {
         "name": "♾ Навсегда",
         "duration_days": 99999,
-        "price": 1488,  
+        "price": 1488,
         "label": "Подписка навсегда",
     },
 }
 
 # Валюта (RUB, USD, EUR, UAH, XTR для Telegram Stars)
 CURRENCY = "XTR"
-
-# Файл базы данных пользователей (JSON)
-DATABASE_FILE = "users_db.json"
 
 # Таймаут для HTTP-запросов
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
@@ -113,161 +110,134 @@ MONTHS_RU = {
 }
 
 
-# ======================== БАЗА ДАННЫХ (JSON) ========================
+# ======================== БАЗА ДАННЫХ (PostgreSQL) ========================
 
 class UserDatabase:
     """
-    Простая JSON-база данных для хранения информации о пользователях.
-
-    Структура записи:
-    {
-        "user_id": {
-            "username": "имя",
-            "free_requests": 2,
-            "subscription_until": null или timestamp,
-            "total_requests": 0,
-            "registered_at": timestamp
-        }
-    }
+    База данных PostgreSQL для хранения информации о пользователях.
     """
 
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        self.data: dict = {}
-        self._load()
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.pool = None
 
-    def _load(self):
-        """Загружает данные из файла."""
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-                logger.info(f"📂 База данных загружена: {len(self.data)} пользователей")
-            except Exception as e:
-                logger.error(f"Ошибка загрузки БД: {e}")
-                self.data = {}
-        else:
-            self.data = {}
-            self._save()
+    async def init(self):
+        """Создаёт пул соединений и таблицу."""
+        self.pool = await asyncpg.create_pool(self.db_url)
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT DEFAULT '',
+                    free_requests INT DEFAULT 2,
+                    subscription_until DOUBLE PRECISION DEFAULT NULL,
+                    total_requests INT DEFAULT 0,
+                    registered_at DOUBLE PRECISION DEFAULT 0
+                )
+            """)
+        logger.info("📂 База данных PostgreSQL подключена")
 
-    def _save(self):
-        """Сохраняет данные в файл."""
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения БД: {e}")
-
-    def get_user(self, user_id: int) -> dict:
+    async def get_user(self, user_id: int) -> dict:
         """Получает или создаёт пользователя."""
-        uid = str(user_id)
-        if uid not in self.data:
-            self.data[uid] = {
-                "username": "",
-                "free_requests": FREE_REQUESTS,
-                "subscription_until": None,
-                "total_requests": 0,
-                "registered_at": time.time(),
-            }
-            self._save()
-            logger.info(f"👤 Новый пользователь: {user_id}")
-        return self.data[uid]
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            if row is None:
+                now = time.time()
+                await conn.execute(
+                    "INSERT INTO users (user_id, username, free_requests, subscription_until, total_requests, registered_at) VALUES ($1, $2, $3, $4, $5, $6)",
+                    user_id, "", FREE_REQUESTS, None, 0, now
+                )
+                logger.info(f"👤 Новый пользователь: {user_id}")
+                return {
+                    "username": "",
+                    "free_requests": FREE_REQUESTS,
+                    "subscription_until": None,
+                    "total_requests": 0,
+                    "registered_at": now,
+                }
+            return dict(row)
 
-    def update_user(self, user_id: int, **kwargs):
+    async def update_user(self, user_id: int, **kwargs):
         """Обновляет поля пользователя."""
-        uid = str(user_id)
-        if uid in self.data:
-            self.data[uid].update(kwargs)
-            self._save()
+        await self.get_user(user_id)
+        for key, value in kwargs.items():
+            async with self.pool.acquire() as conn:
+                await conn.execute(f"UPDATE users SET {key} = $1 WHERE user_id = $2", value, user_id)
 
-    def has_access(self, user_id: int) -> bool:
-        """Проверяет, есть ли у пользователя доступ (бесплатные запросы или подписка)."""
-        user = self.get_user(user_id)
-
-        # Проверяем подписку
+    async def has_access(self, user_id: int) -> bool:
+        """Проверяет, есть ли у пользователя доступ."""
+        user = await self.get_user(user_id)
         sub_until = user.get("subscription_until")
         if sub_until and time.time() < sub_until:
             return True
-
-        # Проверяем бесплатные запросы
         if user.get("free_requests", 0) > 0:
             return True
-
         return False
 
-    def use_request(self, user_id: int):
-        """Тратит один запрос (бесплатный, если нет подписки)."""
-        user = self.get_user(user_id)
-        uid = str(user_id)
+    async def use_request(self, user_id: int):
+        """Тратит один запрос."""
+        user = await self.get_user(user_id)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET total_requests = total_requests + 1 WHERE user_id = $1", user_id
+            )
+            sub_until = user.get("subscription_until")
+            if sub_until and time.time() < sub_until:
+                return
+            if user.get("free_requests", 0) > 0:
+                await conn.execute(
+                    "UPDATE users SET free_requests = free_requests - 1 WHERE user_id = $1", user_id
+                )
 
-        # Увеличиваем общий счётчик
-        self.data[uid]["total_requests"] = user.get("total_requests", 0) + 1
-
-        # Если есть активная подписка — не тратим бесплатные
-        sub_until = user.get("subscription_until")
-        if sub_until and time.time() < sub_until:
-            self._save()
-            return
-
-        # Тратим бесплатный запрос
-        free = user.get("free_requests", 0)
-        if free > 0:
-            self.data[uid]["free_requests"] = free - 1
-            self._save()
-
-    def get_remaining_free(self, user_id: int) -> int:
+    async def get_remaining_free(self, user_id: int) -> int:
         """Возвращает количество оставшихся бесплатных запросов."""
-        user = self.get_user(user_id)
+        user = await self.get_user(user_id)
         return user.get("free_requests", 0)
 
-    def is_subscribed(self, user_id: int) -> bool:
+    async def is_subscribed(self, user_id: int) -> bool:
         """Проверяет, есть ли активная подписка."""
-        user = self.get_user(user_id)
+        user = await self.get_user(user_id)
         sub_until = user.get("subscription_until")
-        if sub_until and time.time() < sub_until:
-            return True
-        return False
+        return bool(sub_until and time.time() < sub_until)
 
-    def get_subscription_end(self, user_id: int) -> Optional[str]:
-        """Возвращает дату окончания подписки в красивом формате."""
-        user = self.get_user(user_id)
+    async def get_subscription_end(self, user_id: int) -> Optional[str]:
+        """Возвращает дату окончания подписки."""
+        user = await self.get_user(user_id)
         sub_until = user.get("subscription_until")
         if sub_until and time.time() < sub_until:
             dt = datetime.fromtimestamp(sub_until)
             return f"{dt.day} {MONTHS_RU[dt.month]} {dt.year} г."
         return None
 
-    def add_subscription(self, user_id: int, days: int):
+    async def add_subscription(self, user_id: int, days: int):
         """Добавляет подписку на указанное количество дней."""
-        user = self.get_user(user_id)
-        uid = str(user_id)
-
-        # Если подписка уже есть — продлеваем от текущей даты окончания
+        user = await self.get_user(user_id)
         sub_until = user.get("subscription_until")
         if sub_until and time.time() < sub_until:
             base_time = sub_until
         else:
             base_time = time.time()
-
-        new_until = base_time + (days * 86400)  # 86400 секунд в дне
-        self.data[uid]["subscription_until"] = new_until
-        self._save()
+        new_until = base_time + (days * 86400)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET subscription_until = $1 WHERE user_id = $2", new_until, user_id
+            )
         logger.info(f"💳 Подписка для {user_id}: +{days} дней (до {datetime.fromtimestamp(new_until)})")
 
-    def get_stats(self, user_id: int) -> dict:
+    async def get_stats(self, user_id: int) -> dict:
         """Возвращает статистику пользователя."""
-        user = self.get_user(user_id)
+        user = await self.get_user(user_id)
         return {
             "free_requests": user.get("free_requests", 0),
             "total_requests": user.get("total_requests", 0),
-            "is_subscribed": self.is_subscribed(user_id),
-            "subscription_end": self.get_subscription_end(user_id),
+            "is_subscribed": await self.is_subscribed(user_id),
+            "subscription_end": await self.get_subscription_end(user_id),
             "registered_at": user.get("registered_at", 0),
         }
 
 
 # Инициализация базы данных
-db = UserDatabase(DATABASE_FILE)
+db = UserDatabase(DATABASE_URL)
 
 
 # ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
@@ -302,7 +272,7 @@ def format_visits(visits: int) -> str:
 
 
 def format_price(price_kopecks: int) -> str:
-    """Форматирует цену из копеек в рубли."""
+    """Форматирует цену."""
     if CURRENCY == "RUB":
         return f"{price_kopecks / 100:.0f} ₽"
     elif CURRENCY == "USD":
@@ -576,14 +546,13 @@ def get_no_access_keyboard() -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     """Обработчик /start."""
-    # Регистрируем пользователя в базе
-    user = db.get_user(message.from_user.id)
-    db.update_user(
+    user = await db.get_user(message.from_user.id)
+    await db.update_user(
         message.from_user.id,
         username=message.from_user.username or "",
     )
 
-    stats = db.get_stats(message.from_user.id)
+    stats = await db.get_stats(message.from_user.id)
     free = stats["free_requests"]
     is_sub = stats["is_subscribed"]
 
@@ -623,13 +592,13 @@ async def cmd_help(message: Message):
 
 @router.message(Command("profile"))
 async def cmd_profile(message: Message):
-    """Обработчик /profile — показывает профиль пользователя."""
+    """Обработчик /profile."""
     await show_profile(message)
 
 
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
-    """Обработчик /subscribe — показывает варианты подписки."""
+    """Обработчик /subscribe."""
     await show_subscription(message)
 
 
@@ -671,7 +640,11 @@ async def send_help_text(target, edit: bool = False):
     )
     kb = get_back_keyboard()
     if edit and isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb)
+        try:
+            await target.message.delete()
+        except Exception:
+            pass
+        await target.message.answer(text, reply_markup=kb)
     else:
         await target.answer(text, reply_markup=kb)
 
@@ -683,9 +656,8 @@ async def show_profile(target, edit: bool = False):
     else:
         user_id = target.from_user.id
 
-    stats = db.get_stats(user_id)
+    stats = await db.get_stats(user_id)
 
-    # Дата регистрации в боте
     reg_ts = stats.get("registered_at", 0)
     if reg_ts:
         reg_dt = datetime.fromtimestamp(reg_ts)
@@ -721,7 +693,11 @@ async def show_profile(target, edit: bool = False):
     ])
 
     if edit and isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb)
+        try:
+            await target.message.delete()
+        except Exception:
+            pass
+        await target.message.answer(text, reply_markup=kb)
     else:
         await target.answer(text, reply_markup=kb)
 
@@ -738,7 +714,7 @@ async def show_subscription(target, edit: bool = False):
     else:
         user_id = target.from_user.id
 
-    stats = db.get_stats(user_id)
+    stats = await db.get_stats(user_id)
     if stats["is_subscribed"]:
         current = f"⭐ Текущая подписка активна до: <b>{stats['subscription_end']}</b>"
     else:
@@ -764,7 +740,11 @@ async def show_subscription(target, edit: bool = False):
     kb = get_subscription_keyboard()
 
     if edit and isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb)
+        try:
+            await target.message.delete()
+        except Exception:
+            pass
+        await target.message.answer(text, reply_markup=kb)
     else:
         await target.answer(text, reply_markup=kb)
 
@@ -774,7 +754,7 @@ async def show_subscription(target, edit: bool = False):
 @router.callback_query(F.data == "start")
 async def callback_start(callback: CallbackQuery):
     """Возврат на главную."""
-    stats = db.get_stats(callback.from_user.id)
+    stats = await db.get_stats(callback.from_user.id)
     free = stats["free_requests"]
     is_sub = stats["is_subscribed"]
 
@@ -791,25 +771,32 @@ async def callback_start(callback: CallbackQuery):
         f"📌 Отправь мне <b>username</b> или <b>ID</b> игрока!\n"
         f"💡 Например: <code>Roblox</code> или <code>1</code>"
     )
-    await callback.message.edit_text(text, reply_markup=get_start_keyboard())
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(text, reply_markup=get_start_keyboard())
     await callback.answer()
 
 
 @router.callback_query(F.data == "search_player")
 async def callback_search_player(callback: CallbackQuery):
     """Кнопка 'Найти игрока'."""
-    # Проверяем доступ
-    if not db.has_access(callback.from_user.id):
+    if not await db.has_access(callback.from_user.id):
         text = (
             f"🔒 <b>Доступ ограничен</b>\n\n"
             f"Твои бесплатные запросы закончились!\n"
             f"Оформи подписку, чтобы продолжить поиск. ⭐"
         )
-        await callback.message.edit_text(text, reply_markup=get_no_access_keyboard())
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(text, reply_markup=get_no_access_keyboard())
         await callback.answer()
         return
 
-    stats = db.get_stats(callback.from_user.id)
+    stats = await db.get_stats(callback.from_user.id)
     if stats["is_subscribed"]:
         remaining_text = "⭐ У тебя активная подписка — безлимитные запросы!"
     else:
@@ -821,8 +808,11 @@ async def callback_search_player(callback: CallbackQuery):
         f"💡 Примеры: <code>Roblox</code>, <code>builderman</code>, <code>1</code>\n\n"
         f"{remaining_text}"
     )
-    await callback.message.delete()
-    await callback.message.answer(text, reply_markup=get_back_keyboard())    
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(text, reply_markup=get_back_keyboard())
     await callback.answer()
 
 
@@ -853,7 +843,11 @@ async def callback_about(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 В начало", callback_data="start")],
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
 
 
@@ -886,8 +880,7 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
     price = plan["price"]
     label = plan["label"]
 
-    # Проверяем, настроен ли платёжный токен
-    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN:
+    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN.strip():
         await callback.answer(
             "⚠️ Платёжная система не настроена! "
             "Администратору нужно указать PAYMENT_TOKEN.",
@@ -895,9 +888,7 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
         )
         return
 
-    # Формируем payload (передаём plan_id для идентификации после оплаты)
     payload = f"sub_{plan_id}_{callback.from_user.id}"
-
     prices = [LabeledPrice(label=label, amount=price)]
 
     try:
@@ -933,23 +924,14 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
 
 @router.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery, bot: Bot):
-    """
-    Обработчик предварительной проверки платежа.
-    Telegram отправляет этот запрос перед списанием средств.
-    Нужно ответить в течение 10 секунд.
-    """
-    # Здесь можно добавить дополнительные проверки
-    # (например, проверить, что товар ещё доступен)
+    """Обработчик предварительной проверки платежа."""
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-    logger.info(f"💳 Pre-checkout от пользователя {pre_checkout_query.from_user.id}: {pre_checkout_query.invoice_payload}")
+    logger.info(f"💳 Pre-checkout от {pre_checkout_query.from_user.id}: {pre_checkout_query.invoice_payload}")
 
 
 @router.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
 async def process_successful_payment(message: Message):
-    """
-    Обработчик успешного платежа.
-    Вызывается после успешного списания средств.
-    """
+    """Обработчик успешного платежа."""
     payment = message.successful_payment
     payload = payment.invoice_payload
     user_id = message.from_user.id
@@ -960,7 +942,6 @@ async def process_successful_payment(message: Message):
         f"amount={payment.total_amount} {payment.currency}"
     )
 
-    # Парсим payload: "sub_{plan_id}_{user_id}"
     try:
         parts = payload.split("_")
         plan_id = parts[1]
@@ -975,11 +956,10 @@ async def process_successful_payment(message: Message):
         await message.answer("⚠️ Ошибка обработки платежа. Обратитесь в поддержку.")
         return
 
-    # Активируем подписку
     days = plan["duration_days"]
-    db.add_subscription(user_id, days)
+    await db.add_subscription(user_id, days)
 
-    end_date = db.get_subscription_end(user_id)
+    end_date = await db.get_subscription_end(user_id)
 
     text = (
         f"🎉 <b>Оплата прошла успешно!</b>\n"
@@ -1012,9 +992,10 @@ async def callback_refresh(callback: CallbackQuery):
 
     if error:
         try:
-            await callback.message.edit_caption(caption=error, reply_markup=get_back_keyboard())
+            await callback.message.delete()
         except Exception:
-            await callback.message.edit_text(error, reply_markup=get_back_keyboard())
+            pass
+        await callback.message.answer(error, reply_markup=get_back_keyboard())
         return
 
     keyboard = get_player_keyboard(roblox_user_id)
@@ -1031,6 +1012,10 @@ async def callback_refresh(callback: CallbackQuery):
             await callback.message.edit_caption(caption=text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Ошибка обновления: {e}")
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         try:
             if avatar_bytes:
                 photo = BufferedInputFile(avatar_bytes, filename="avatar.png")
@@ -1076,7 +1061,7 @@ async def callback_games(callback: CallbackQuery):
         text = (
             f"🎮 <b>Игры игрока @{username}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{chr(10).join(lines)}\n\n"  # Используем chr(10) вместо \n в f-string
+            f"{chr(10).join(lines)}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -1089,9 +1074,10 @@ async def callback_games(callback: CallbackQuery):
         await callback.message.edit_caption(caption=text, reply_markup=kb)
     except Exception:
         try:
-            await callback.message.edit_text(text, reply_markup=kb)
+            await callback.message.delete()
         except Exception:
-            await callback.message.answer(text, reply_markup=kb)
+            pass
+        await callback.message.answer(text, reply_markup=kb)
 
 
 # ======================== ПОИСК ИГРОКА ========================
@@ -1105,11 +1091,10 @@ async def handle_search(message: Message):
 
     user_id = message.from_user.id
 
-    # Регистрируем пользователя если новый
-    db.get_user(user_id)
+    await db.get_user(user_id)
 
     # === ПРОВЕРКА ДОСТУПА ===
-    if not db.has_access(user_id):
+    if not await db.has_access(user_id):
         text = (
             f"🔒 <b>Доступ ограничен</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1121,12 +1106,10 @@ async def handle_search(message: Message):
         await message.answer(text, reply_markup=get_no_access_keyboard())
         return
 
-    # Сообщение-загрузка
     loading_msg = await message.answer("⏳ <b>Ищу информацию об игроке...</b> 🔍")
 
     roblox_user_id = None
 
-    # Определяем: ID или username
     if query.isdigit():
         roblox_user_id = int(query)
     else:
@@ -1143,7 +1126,6 @@ async def handle_search(message: Message):
         )
         return
 
-    # Собираем карточку
     try:
         text, avatar_bytes, error = await build_player_card(roblox_user_id)
     except Exception as e:
@@ -1159,10 +1141,9 @@ async def handle_search(message: Message):
         return
 
     # === ТРАТИМ ЗАПРОС ===
-    db.use_request(user_id)
+    await db.use_request(user_id)
 
-    # Информация об оставшихся запросах
-    stats = db.get_stats(user_id)
+    stats = await db.get_stats(user_id)
     if stats["is_subscribed"]:
         remaining_info = "\n\n⭐ <i>Подписка активна — безлимитные запросы</i>"
     else:
@@ -1176,13 +1157,11 @@ async def handle_search(message: Message):
 
     keyboard = get_player_keyboard(roblox_user_id)
 
-    # Удаляем загрузочное сообщение
     try:
         await loading_msg.delete()
     except Exception:
         pass
 
-    # Отправляем карточку
     try:
         if avatar_bytes:
             photo = BufferedInputFile(avatar_bytes, filename="avatar.png")
@@ -1204,7 +1183,6 @@ async def handle_search(message: Message):
 
 async def main():
     """Главная функция запуска."""
-    # Проверки
     if BOT_TOKEN == "ВАШ_ТОКЕН_БОТА" or not BOT_TOKEN:
         print("\n" + "=" * 55)
         print("❌ ОШИБКА: Не указан токен бота!")
@@ -1213,12 +1191,15 @@ async def main():
         print("=" * 55 + "\n")
         return
 
-    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN:
+    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN.strip():
         print("\n" + "=" * 55)
         print("⚠️  ВНИМАНИЕ: Платёжный токен не настроен!")
         print("Оплата не будет работать до настройки PAYMENT_TOKEN")
         print("Получить: @BotFather → /mybots → Payments")
         print("=" * 55 + "\n")
+
+    # Инициализация базы данных PostgreSQL
+    await db.init()
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -1232,7 +1213,7 @@ async def main():
     print("🎮  Roblox OSINT account запущен!")
     print(f"💰  Валюта: {CURRENCY}")
     print(f"🆓  Бесплатных запросов: {FREE_REQUESTS}")
-    print(f"📂  База данных: {DATABASE_FILE}")
+    print(f"📂  База данных: PostgreSQL (Railway)")
     print("📡  Ожидаю сообщения...")
     print("=" * 55 + "\n")
 
