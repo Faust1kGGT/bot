@@ -2,3 +2,4 @@ aiogram
 aiohttp
 requests
 psycopg2
+asyncpg
