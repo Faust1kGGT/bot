@@ -48,7 +48,7 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "7947605764:AAGWTfndHVIyN3SV7_zpe3Zr9CoTTI7F8SI"
 
 # Токен платёжной системы (получить у @BotFather → /mybots → Payments)
-PAYMENT_TOKEN = " "
+PAYMENT_TOKEN = ""
 
 # Строка подключения к PostgreSQL (Railway)
 DATABASE_URL = "postgresql://postgres:NskrxqFEpVXbnlVZSSPyQfIEIauSvMAT@crossover.proxy.rlwy.net:55072/railway"
@@ -880,13 +880,6 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
     price = plan["price"]
     label = plan["label"]
 
-    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN.strip():
-        await callback.answer(
-            "⚠️ Платёжная система не настроена! "
-            "Администратору нужно указать PAYMENT_TOKEN.",
-            show_alert=True,
-        )
-        return
 
     payload = f"sub_{plan_id}_{callback.from_user.id}"
     prices = [LabeledPrice(label=label, amount=price)]
@@ -901,7 +894,7 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
                 f"Безлимитные запросы об игроках Roblox"
             ),
             payload=payload,
-            provider_token=PAYMENT_TOKEN,
+            provider_token="",
             currency=CURRENCY,
             prices=prices,
             start_parameter=f"sub_{plan_id}",
@@ -1190,13 +1183,6 @@ async def main():
         print("Получить: @BotFather → /newbot")
         print("=" * 55 + "\n")
         return
-
-    if PAYMENT_TOKEN == "ВАШ_ПЛАТЁЖНЫЙ_ТОКЕН" or not PAYMENT_TOKEN.strip():
-        print("\n" + "=" * 55)
-        print("⚠️  ВНИМАНИЕ: Платёжный токен не настроен!")
-        print("Оплата не будет работать до настройки PAYMENT_TOKEN")
-        print("Получить: @BotFather → /mybots → Payments")
-        print("=" * 55 + "\n")
 
     # Инициализация базы данных PostgreSQL
     await db.init()
