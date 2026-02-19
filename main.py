@@ -48,7 +48,7 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "7947605764:AAGWTfndHVIyN3SV7_zpe3Zr9CoTTI7F8SI"
 
 # Токен платёжной системы (получить у @BotFather → /mybots → Payments)
-PAYMENT_TOKEN = ""
+PAYMENT_TOKEN = " "
 
 # Строка подключения к PostgreSQL (Railway)
 DATABASE_URL = "postgresql://postgres:NskrxqFEpVXbnlVZSSPyQfIEIauSvMAT@crossover.proxy.rlwy.net:55072/railway"
