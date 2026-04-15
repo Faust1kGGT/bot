@@ -51,7 +51,7 @@ BOT_TOKEN = "7947605764:AAGWTfndHVIyN3SV7_zpe3Zr9CoTTI7F8SI"
 PAYMENT_TOKEN = ""
 
 # Строка подключения к PostgreSQL (Railway)
-DATABASE_URL = "postgresql://postgres:NskrxqFEpVXbnlVZSSPyQfIEIauSvMAT@crossover.proxy.rlwy.net:55072/railway"
+DATABASE_URL = "postgresql://postgres:CuaLdKVzvVHxOECkVmrMTjJHuNSAHXmD@postgres.railway.internal:5432/railway"
 
 # Количество бесплатных запросов для новых пользователей
 FREE_REQUESTS = 2
