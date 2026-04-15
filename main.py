@@ -395,6 +395,47 @@ async def get_roblox_badges(session: aiohttp.ClientSession, user_id: int) -> Opt
         return None
 
 
+async def check_friendship(session: aiohttp.ClientSession, user_id: int, friend_id: int) -> Optional[dict]:
+    """Проверяет, есть ли friend_id в друзьях у user_id."""
+    url = f"https://friends.roblox.com/v1/users/{user_id}/friends"
+    try:
+        all_friends = []
+        cursor = ""
+        
+        # Получаем всех друзей постранично
+        while True:
+            params = {"userSort": "StatusFrequents"}
+            if cursor:
+                params["cursor"] = cursor
+                
+            async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
+                if resp.status != 200:
+                    return None
+                    
+                data = await resp.json()
+                friends_page = data.get("data", [])
+                all_friends.extend(friends_page)
+                
+                cursor = data.get("nextPageCursor")
+                if not cursor:
+                    break
+        
+        # Ищем friend_id в списке друзей
+        for friend in all_friends:
+            if friend.get("id") == friend_id:
+                return {
+                    "is_friend": True,
+                    "friend_name": friend.get("name"),
+                    "friend_display_name": friend.get("displayName"),
+                }
+        
+        return {"is_friend": False}
+        
+    except Exception as e:
+        logger.error(f"Ошибка проверки дружбы {user_id} и {friend_id}: {e}")
+        return None
+
+
 async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     """Скачивает изображение."""
     try:
@@ -491,6 +532,7 @@ def get_start_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👤 Мой профиль", callback_data="my_profile"),
         ],
         [InlineKeyboardButton(text="⭐ Подписка", callback_data="subscription")],
+        [InlineKeyboardButton(text="👥 Проверить дружбу", callback_data="check_friendship")],
         [InlineKeyboardButton(text="👨‍💻 Автор", callback_data="about")],
     ])
 
@@ -541,6 +583,14 @@ def get_no_access_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def get_check_friendship_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для проверки дружбы."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Искать другого", callback_data="search_player")],
+        [InlineKeyboardButton(text="🏠 В начало", callback_data="start")],
+    ])
+
+
 # ======================== ОБРАБОТЧИКИ КОМАНД ========================
 
 @router.message(CommandStart())
@@ -577,7 +627,8 @@ async def cmd_start(message: Message):
         f"  ⭐ Отображает онлайн-статус\n"
         f"  ⭐ Показывает количество друзей\n"
         f"  ⭐ Выводит список игр игрока\n"
-        f"  ⭐ Показывает значки Roblox\n\n"
+        f"  ⭐ Показывает значки Roblox\n"
+        f"  ⭐ Проверяет дружбу между игроками\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📌 <b>Как пользоваться:</b>\n"
         f"Просто отправь мне <b>username</b> или <b>ID</b> игрока!\n\n"
@@ -621,6 +672,13 @@ async def send_help_text(target, edit: bool = False):
         f"  📝 Пример: <code>1</code>\n"
         f"  📝 Пример: <code>156</code>\n\n"
         f"─────────────────────\n\n"
+        f"👥 <b>Проверка дружбы:</b>\n"
+        f"Отправь два username или ID через пробел.\n"
+        f"Бот проверит, есть ли второй игрок в друзьях у первого.\n"
+        f"  📝 Пример: <code>Roblox builderman</code>\n"
+        f"  📝 Пример: <code>1 156</code>\n"
+        f"  📝 Пример: <code>Roblox 156</code>\n\n"
+        f"─────────────────────\n\n"
         f"💰 <b>Система запросов:</b>\n"
         f"  🆓 Новым пользователям — <b>{FREE_REQUESTS}</b> бесплатных запроса\n"
         f"  ⭐ Далее нужна подписка\n"
@@ -637,7 +695,8 @@ async def send_help_text(target, edit: bool = False):
         f"  🚫 Статус бана\n"
         f"  ✅ Верификацию\n"
         f"  🏆 Значки Roblox\n"
-        f"  🎮 Список игр игрока\n\n"
+        f"  🎮 Список игр игрока\n"
+        f"  💚 Проверку дружбы между игроками\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━"
     )
     kb = get_back_keyboard()
@@ -818,6 +877,41 @@ async def callback_search_player(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "check_friendship")
+async def callback_check_friendship(callback: CallbackQuery):
+    """Кнопка 'Проверить дружбу'."""
+    if not await db.has_access(callback.from_user.id):
+        text = (
+            f"🔒 <b>Доступ ограничен</b>\n\n"
+            f"Твои бесплатные запросы закончились!\n"
+            f"Оформи подписку, чтобы продолжить. ⭐"
+        )
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(text, reply_markup=get_no_access_keyboard())
+        await callback.answer()
+        return
+
+    text = (
+        f"👥 <b>ПРОВЕРКА ДРУЖБЫ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Отправь мне два username или ID через пробел:\n\n"
+        f"💡 Формат: <code>username1 username2</code>\n"
+        f"💡 Или: <code>ID1 ID2</code>\n\n"
+        f"📝 Пример: <code>Roblox builderman</code>\n"
+        f"📝 Пример: <code>1 156</code>\n\n"
+        f"Бот проверит, есть ли второй игрок в друзьях у первого."
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(text, reply_markup=get_check_friendship_keyboard())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "help")
 async def callback_help(callback: CallbackQuery):
     """Кнопка 'Помощь'."""
@@ -881,7 +975,6 @@ async def callback_buy(callback: CallbackQuery, bot: Bot):
 
     price = plan["price"]
     label = plan["label"]
-
 
     payload = f"sub_{plan_id}_{callback.from_user.id}"
     prices = [LabeledPrice(label=label, amount=price)]
@@ -1077,15 +1170,106 @@ async def callback_games(callback: CallbackQuery):
 
 # ======================== ПОИСК ИГРОКА ========================
 
+async def handle_friendship_check(message: Message, query1: str, query2: str):
+    """Обработчик проверки дружбы между двумя игроками."""
+    user_id = message.from_user.id
+    loading_msg = await message.answer("⏳ <b>Проверяю дружбу...</b> 👥")
+
+    async with aiohttp.ClientSession() as session:
+        # Получаем ID первого игрока
+        if query1.isdigit():
+            user1_id = int(query1)
+            user1_info = await get_user_by_id(session, user1_id)
+        else:
+            user1_data = await get_user_id_by_username(session, query1)
+            if user1_data:
+                user1_id = user1_data.get("id")
+                user1_info = await get_user_by_id(session, user1_id)
+            else:
+                user1_info = None
+
+        if not user1_info:
+            await loading_msg.edit_text(
+                f"❌ Первый игрок (<code>{query1}</code>) не найден!",
+                reply_markup=get_check_friendship_keyboard(),
+            )
+            return
+
+        # Получаем ID второго игрока
+        if query2.isdigit():
+            user2_id = int(query2)
+            user2_info = await get_user_by_id(session, user2_id)
+        else:
+            user2_data = await get_user_id_by_username(session, query2)
+            if user2_data:
+                user2_id = user2_data.get("id")
+                user2_info = await get_user_by_id(session, user2_id)
+            else:
+                user2_info = None
+
+        if not user2_info:
+            await loading_msg.edit_text(
+                f"❌ Второй игрок (<code>{query2}</code>) не найден!",
+                reply_markup=get_check_friendship_keyboard(),
+            )
+            return
+
+        # Проверяем дружбу
+        friendship = await check_friendship(session, user1_id, user2_id)
+
+    # Тратим запрос
+    await db.use_request(user_id)
+
+    user1_name = user1_info.get("name", "Unknown")
+    user2_name = user2_info.get("name", "Unknown")
+
+    if friendship is None:
+        text = (
+            f"⚠️ <b>Ошибка проверки дружбы</b>\n\n"
+            f"Не удалось получить список друзей. Попробуй позже!"
+        )
+    elif friendship.get("is_friend"):
+        text = (
+            f"✅ <b>ДРУЗЬЯ!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 <b>Игрок 1:</b> @{user1_name} (ID: {user1_id})\n"
+            f"👤 <b>Игрок 2:</b> @{user2_name} (ID: {user2_id})\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💚 <b>@{user2_name}</b> есть в друзьях у <b>@{user1_name}</b>!"
+        )
+    else:
+        text = (
+            f"❌ <b>НЕ ДРУЗЬЯ</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 <b>Игрок 1:</b> @{user1_name} (ID: {user1_id})\n"
+            f"👤 <b>Игрок 2:</b> @{user2_name} (ID: {user2_id})\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💔 <b>@{user2_name}</b> НЕ найден в друзьях у <b>@{user1_name}</b>."
+        )
+
+    stats = await db.get_stats(user_id)
+    if stats["is_subscribed"]:
+        remaining_info = "\n\n⭐ <i>Подписка активна — безлимитные запросы</i>"
+    else:
+        remaining = stats["free_requests"]
+        if remaining > 0:
+            remaining_info = f"\n\n🆓 <i>Осталось бесплатных запросов: {remaining}</i>"
+        else:
+            remaining_info = "\n\n⚠️ <i>Это был твой последний бесплатный запрос!</i>"
+
+    text += remaining_info
+
+    await loading_msg.edit_text(text, reply_markup=get_check_friendship_keyboard())
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_search(message: Message):
-    """Обработчик поиска — username или ID."""
+    """Обработчик поиска — username/ID или проверка дружбы."""
     query = message.text.strip()
     if not query:
         return
 
     user_id = message.from_user.id
-
     await db.get_user(user_id)
 
     # === ПРОВЕРКА ДОСТУПА ===
@@ -1101,6 +1285,15 @@ async def handle_search(message: Message):
         await message.answer(text, reply_markup=get_no_access_keyboard())
         return
 
+    # Проверяем, два ли значения (для проверки дружбы)
+    parts = query.split()
+    
+    if len(parts) == 2:
+        # === ПРОВЕРКА ДРУЖБЫ ===
+        await handle_friendship_check(message, parts[0], parts[1])
+        return
+    
+    # === ОБЫЧНЫЙ ПОИСК ИГРОКА ===
     loading_msg = await message.answer("⏳ <b>Ищу информацию об игроке...</b> 🔍")
 
     roblox_user_id = None
@@ -1135,7 +1328,6 @@ async def handle_search(message: Message):
         await loading_msg.edit_text(error, reply_markup=get_back_keyboard())
         return
 
-    # === ТРАТИМ ЗАПРОС ===
     await db.use_request(user_id)
 
     stats = await db.get_stats(user_id)
@@ -1149,7 +1341,6 @@ async def handle_search(message: Message):
             remaining_info = "\n\n⚠️ <i>Это был твой последний бесплатный запрос!</i>"
 
     text += remaining_info
-
     keyboard = get_player_keyboard(roblox_user_id)
 
     try:
